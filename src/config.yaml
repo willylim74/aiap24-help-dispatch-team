@@ -1,0 +1,289 @@
+# =============================================================================
+# MoveEasy delivery risk-scoring pipeline — configuration
+#
+# This file is the single source of truth for the pipeline. data_preparation.py
+# and model_training.py read every path, column name, cleaning rule, and
+# hyperparameter from here rather than hardcoding them, so re-running the
+# project against a different data drop or model list means editing this
+# file, not the source code.
+#
+# Architecture note: the EDA (eda.ipynb, Sections 10, 18.5, 19, 21-26)
+# establishes a two-stage "hurdle" design rather than a single model:
+#   stage1_classification -- P(is_late), trained on every row
+#   stage2_regression      -- E[lateness_minutes | is_late], trained only on
+#                              the late-labelled subset of each fold
+# Both stages share one preprocessing pipeline (see data_preparation.py).
+# =============================================================================
+
+random_state: 42
+
+data:
+  raw_path: "data/data.csv"
+  # columns dropped immediately on load: high-cardinality identifiers that
+  # are neither predictive features nor needed for target engineering
+  # (EDA: kept out of the feature set throughout to avoid overfitting to
+  # per-entity identity rather than genuine risk signal)
+  id_columns_to_drop: ["delivery_id", "client_id", "driver_id"]
+
+target:
+  # raw timestamp columns the two targets are derived from
+  delivery_datetime_col: "delivery_datetime"
+  promised_datetime_col: "promised_delivery_datetime"
+  # engineered target names, added by data_preparation.py
+  severity_col: "lateness_minutes"      # continuous: minutes late (negative = early)
+  classification_col: "is_late"         # binary: 1 if lateness_minutes > 0
+
+cleaning:
+  datetime_columns:
+    - "booking_datetime"
+    - "pickup_datetime"
+    - "promised_delivery_datetime"
+    - "delivery_datetime"
+  # EDA Section 2/11: 750 exact duplicate rows and ~474-478 rows with a
+  # physically impossible delivery-before-pickup timestamp were found and
+  # removed
+  drop_exact_duplicates: true
+  drop_impossible_timestamp_rows: true   # delivery_datetime < pickup_datetime
+  # casing/typo normalization maps (EDA Section 2: branch had Cnetral/west/
+  # EAST/Noth variants; parcel_category had casing + over-sized/refrig.
+  # spelling variants)
+  casing_maps:
+    branch:
+      cnetral: "Central"
+      central: "Central"
+      west: "West"
+      east: "East"
+      noth: "North"
+      north: "North"
+    parcel_category:
+      standard: "standard"
+      fragile: "fragile"
+      over-sized: "oversized"
+      oversized: "oversized"
+      refrig.: "refrigerated"
+      refrigerated: "refrigerated"
+  lowercase_strip_columns: ["vehicle_type", "payment_method"]
+  strip_only_columns: ["delivery_priority"]
+  # columns stored as text in the source data despite being numeric; coerced
+  # to numeric, and any negative value (a -1 missingness sentinel, per EDA
+  # Section 2) recoded to NaN
+  numeric_as_text_columns:
+    - "parcel_weight_kg"
+    - "parcel_value_sgd"
+    - "num_stops_on_route"
+    - "driver_experience_months"
+    - "recipient_postal_code"
+  # recipient_postal_code is a zone identifier, not a continuous quantity --
+  # kept as a plain string category after numeric coercion (EDA Section 3)
+  postal_code_column: "recipient_postal_code"
+
+features:
+  # dispatch-time-available raw datetime inputs (delivery_datetime is
+  # deliberately EXCLUDED here -- it is the outcome timestamp the target is
+  # computed from; including it or anything derived from it is target
+  # leakage, per the eda-mimo.ipynb comparison analysis)
+  datetime_input_columns:
+    - "booking_datetime"
+    - "pickup_datetime"
+    - "promised_delivery_datetime"
+  numeric_base_columns:
+    - "distance_km"
+    - "parcel_weight_kg"
+    - "parcel_value_sgd"
+    - "num_stops_on_route"
+    - "driver_experience_months"
+  categorical_columns:
+    - "branch"
+    - "parcel_category"
+    - "delivery_priority"
+    - "vehicle_type"
+    - "payment_method"
+    - "recipient_postal_code"
+  # columns whose missingness gets its own indicator feature (EDA Section 2:
+  # ~4% missingness on each, consistent with independent random corruption)
+  missing_indicator_source_columns:
+    - "parcel_weight_kg"
+    - "parcel_value_sgd"
+    - "num_stops_on_route"
+    - "driver_experience_months"
+    - "vehicle_type"
+    - "payment_method"
+    - "recipient_postal_code"
+
+missing_value_imputation:
+  numeric_strategy: "median"
+  categorical_strategy: "constant"
+  categorical_fill_value: "missing"
+
+outlier_handling:
+  # EDA Section 8: outliers here are informative (statistically real, if
+  # modest, shift in the target) rather than noise -- the recommendation was
+  # to flag them as an explicit feature rather than cap or remove them
+  method: "flag"
+  iqr_multiplier: 1.5
+  # which numeric columns get an `<col>_is_outlier` flag
+  apply_to_columns:
+    - "distance_km"
+    - "parcel_weight_kg"
+    - "parcel_value_sgd"
+    - "num_stops_on_route"
+    - "driver_experience_months"
+
+feature_engineering:
+  temporal:
+    enabled: true
+    # all derived from pickup/booking/promised timestamps only (dispatch-time
+    # safe); see data_preparation.DatetimeFeatureTransformer
+    derived_features:
+      - "pickup_hour"
+      - "pickup_dayofweek"
+      - "pickup_is_weekend"
+      - "promised_window_minutes"   # promised - pickup: the time budget for the trip
+      - "booking_lead_minutes"      # pickup - booking
+
+preprocessing:
+  numeric_scaler: "standard"
+  categorical_encoder: "onehot"
+  categorical_encoder_handle_unknown: "ignore"
+
+split:
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+  # EDA Section 13 / this project's requirement: stratify on the
+  # classification target so both stages share one leakage-safe split;
+  # stage 2 is filtered to the late-only subset of each fold AFTER splitting
+  stratify_on: "is_late"
+
+class_imbalance:
+  # EDA Section 1 / 18.2: is_late is ~11% positive -- imbalanced. Every
+  # classifier that accepts class_weight is fixed to 'balanced' for its
+  # entire baseline fit and tuning search (not searched as an option, since
+  # Section 18.2 already established it as beneficial). Models with no
+  # class_weight parameter (Gradient Boosting) use an equivalent balanced
+  # sample_weight computed at fit time instead. KNN supports neither and is
+  # trained unweighted.
+  positive_rate_threshold: 0.20   # below this, treat as imbalanced
+  strategy: "balanced"
+  applies_to_models: ["Logistic", "Decision Tree", "Random Forest"]
+  sample_weight_models: ["Gradient Boosting"]
+  not_applicable_models: ["K-Nearest Neighbors"]
+
+models:
+  regression:
+    naive:
+      name: "Naive (Mean Dummy)"
+      estimator: "DummyRegressor"
+      params: { strategy: "mean" }
+    registry:
+      - name: "Linear"
+        estimator: "LinearRegression"
+        params: {}
+        search_family: "none"        # no hyperparameters to tune
+        param_grid: {}
+      - name: "Ridge"
+        estimator: "Ridge"
+        params: {}
+        search_family: "linear"      # GridSearchCV
+        param_grid:
+          alpha: [0.1, 1.0, 10.0, 50.0, 100.0]
+      - name: "Lasso"
+        estimator: "Lasso"
+        params: {}
+        search_family: "linear"      # GridSearchCV
+        param_grid:
+          alpha: [0.01, 0.1, 1.0, 10.0]
+      - name: "Decision Tree"
+        estimator: "DecisionTreeRegressor"
+        params: {}
+        search_family: "tree"        # HalvingRandomSearchCV
+        param_grid:
+          max_depth: [3, 5, 8, null]
+          min_samples_leaf: [1, 10, 30]
+      - name: "Random Forest"
+        estimator: "RandomForestRegressor"
+        params: {}
+        search_family: "tree"        # HalvingRandomSearchCV
+        param_grid:
+          n_estimators: [100, 200, 300]
+          max_depth: [null, 8, 16]
+          min_samples_leaf: [1, 5, 20]
+
+  classification:
+    naive:
+      name: "Naive (Stratified Dummy)"
+      estimator: "DummyClassifier"
+      params: { strategy: "stratified" }
+    registry:
+      - name: "Logistic"
+        estimator: "LogisticRegression"
+        params: { max_iter: 1000 }
+        search_family: "linear"      # GridSearchCV
+        param_grid:
+          C: [0.01, 0.1, 1.0, 10.0]
+      - name: "K-Nearest Neighbors"
+        estimator: "KNeighborsClassifier"
+        params: {}
+        search_family: "linear"      # GridSearchCV (not tree-based; small grid)
+        param_grid:
+          n_neighbors: [15, 35, 75]
+          weights: ["uniform", "distance"]
+      - name: "Decision Tree"
+        estimator: "DecisionTreeClassifier"
+        params: {}
+        search_family: "tree"        # HalvingRandomSearchCV
+        param_grid:
+          max_depth: [4, 8, 12, null]
+          min_samples_leaf: [1, 20, 50]
+      - name: "Random Forest"
+        estimator: "RandomForestClassifier"
+        params: {}
+        search_family: "tree"        # HalvingRandomSearchCV
+        param_grid:
+          n_estimators: [100, 200, 300]
+          max_depth: [6, 10, 16, null]
+          min_samples_leaf: [1, 5, 20]
+      - name: "Gradient Boosting"
+        estimator: "GradientBoostingClassifier"
+        params: {}
+        search_family: "tree"        # HalvingRandomSearchCV
+        param_grid:
+          n_estimators: [100, 200, 300]
+          learning_rate: [0.01, 0.05, 0.1]
+          max_depth: [2, 3, 4]
+
+tuning:
+  cv_folds: 3
+  # HalvingRandomSearchCV subsampling (compute-constrained strategy, EDA
+  # Section 21): only applied to the classification stage, whose training
+  # fold is ~104k rows; the regression stage trains on the late-only subset
+  # (~11.5k rows) and needs no subsampling
+  subsample:
+    enabled: true
+    n_rows: 25000
+    applies_to_stage: "classification"
+  halving:
+    factor: 3
+  # winning hyperparameters from every search are always refit on the FULL
+  # training fold (never the search subsample) before evaluation
+
+evaluation:
+  regression:
+    metrics: ["MAE", "MSE", "RMSE", "R2"]
+    ranking_metric: "R2"
+  classification:
+    metrics: ["accuracy", "precision", "recall", "f1", "roc_auc", "pr_auc"]
+    # EDA Section 16: is_late is imbalanced (~11% positive) -> rank by PR-AUC
+    ranking_metric: "pr_auc"
+  # ranked-score evaluation (EDA Section 18.5/19/25 -- the recommended
+  # deployment framing: sort by risk score rather than threshold at 0.5)
+  ranked_score:
+    enabled: true
+    k_fractions: [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50]
+
+output:
+  base_dir: "outputs"
+  models_dir: "outputs/models"
+  results_dir: "outputs/results"
+  checkpoints_dir: "outputs/checkpoints"
+  ledger_path: "outputs/checkpoints/ledger.json"
